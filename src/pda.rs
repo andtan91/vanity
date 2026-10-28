@@ -275,6 +275,55 @@ impl PdaTemplate {
     }
 }
 
+/// Gate a pattern hit: accept only when bump 255 is off-curve, and
+/// cross-check the hot-loop digest against `create_program_address`.
+/// An on-curve hit is discarded — its canonical bump differs, so the
+/// matched address does not exist as a PDA.
+pub fn confirm_hit(
+    layout: &PdaLayout,
+    ground: &[u8; GROUND_LEN],
+    digest: &[u8; 32],
+    program_id: &Pubkey,
+) -> bool {
+    let seeds = layout.seeds_with_ground(ground);
+    let mut refs: Vec<&[u8]> =
+        seeds.iter().map(|s| s.as_slice()).collect();
+    let bump = [BUMP];
+    refs.push(&bump);
+    match Pubkey::create_program_address(&refs, program_id) {
+        Ok(pda) => pda.to_bytes() == *digest,
+        Err(_) => false,
+    }
+}
+
+/// Paste-ready `create_program_address(&[…, &[255]], &ID)` snippet.
+pub fn snippet(seeds: &[Vec<u8>]) -> String {
+    let mut parts: Vec<String> = seeds
+        .iter()
+        .map(|s| {
+            if !s.is_empty()
+                && s.iter().all(|&b| (0x20..0x7f).contains(&b))
+            {
+                format!(
+                    "b\"{}\"",
+                    core::str::from_utf8(s).unwrap()
+                )
+            } else {
+                let bytes: Vec<String> = s
+                    .iter()
+                    .map(|b| format!("0x{b:02x}"))
+                    .collect();
+                format!("&[{}]", bytes.join(", "))
+            }
+        })
+        .collect();
+    parts.push(format!("&[{BUMP}]"));
+    format!(
+        "create_program_address(&[{}], &ID)",
+        parts.join(", ")
+    )
+}
+
 /// Same 62-char alphabet as `grind`'s random seeds.
 pub const ALNUM: &[u8; 62] =
     b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -545,6 +594,58 @@ mod tests {
             assert!(!encoded.starts_with("theia"), "{encoded}");
             assert_eq!(targets.match_mask(&digest), 0, "{encoded}");
         }
+    }
+
+    #[test]
+    fn confirm_hit_accepts_off_curve_and_rejects_on_curve() {
+        // The KAT ground strings are full 16-byte seeds, so use an
+        // empty grind prefix.
+        let layout_plain = PdaLayout::new(&[], "", 0, &program());
+        let ok_ground = b"theia_06bd29104c";
+        let mut tpl = layout_plain.template();
+        tpl.splice(ok_ground);
+        let digest = tpl.digest();
+        assert!(confirm_hit(
+            &layout_plain,
+            ok_ground,
+            &digest,
+            &program()
+        ));
+
+        let bad_ground = b"theia_051de97e00";
+        tpl.splice(bad_ground);
+        let digest = tpl.digest();
+        assert!(!confirm_hit(
+            &layout_plain,
+            bad_ground,
+            &digest,
+            &program()
+        ));
+    }
+
+    #[test]
+    fn confirm_hit_rejects_wrong_digest() {
+        let layout = PdaLayout::new(&[], "", 0, &program());
+        assert!(!confirm_hit(
+            &layout,
+            b"theia_06bd29104c",
+            &[0u8; 32],
+            &program()
+        ));
+    }
+
+    #[test]
+    fn snippet_renders_str_and_binary_seeds() {
+        assert_eq!(
+            snippet(&[b"theia_06bd29104c".to_vec()]),
+            "create_program_address(&[b\"theia_06bd29104c\", \
+             &[255]], &ID)"
+        );
+        assert_eq!(
+            snippet(&[b"pool".to_vec(), vec![0x00, 0xa5]]),
+            "create_program_address(&[b\"pool\", &[0x00, 0xa5], \
+             &[255]], &ID)"
+        );
     }
 
     // ── matcher agreement on random digests ──

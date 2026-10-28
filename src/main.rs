@@ -51,7 +51,9 @@ pub enum Command {
     Grind(GrindArgs),
     GrindKeypair(GrindKeypairArgs),
     GrindDoppler(DopplerArgs),
+    GrindPda(GrindPdaArgs),
     Verify(VerifyArgs),
+    VerifyPda(VerifyPdaArgs),
     #[cfg(feature = "deploy")]
     Deploy(DeployArgs),
 }
@@ -152,6 +154,63 @@ pub struct DopplerArgs {
     /// Number of matching keypairs to find before stopping
     #[clap(long, default_value_t = 1)]
     pub count: u32,
+}
+
+/// Grind a seed for `find_program_address(seeds, program_id)` (CPU
+/// only). The ground seed is `--grind-prefix` plus 16 alnum chars;
+/// only bump 255 is hashed, and on-curve hits are discarded (their
+/// canonical bump differs), so expected attempts double.
+#[derive(Debug, Parser)]
+pub struct GrindPdaArgs {
+    /// The program id the PDA is derived for
+    #[clap(long, value_parser = parse_pubkey)]
+    pub program_id: Pubkey,
+
+    /// Fixed seed, in order. Repeatable. Formats: str:<utf8>,
+    /// hex:<bytes>, pubkey:<base58>, u64le:<n>, u8:<n>
+    #[clap(long, action = clap::ArgAction::Append)]
+    pub seed: Vec<pda::SeedSpec>,
+
+    /// Fixed ASCII prefix inside the ground seed, e.g. "theia_"
+    #[clap(long, default_value = "")]
+    pub grind_prefix: String,
+
+    /// Position of the ground seed among the seeds (default: last)
+    #[clap(long)]
+    pub grind_index: Option<usize>,
+
+    #[clap(flatten)]
+    pub spec: PatternArgs,
+
+    /// Ignored: grind-pda is CPU-only (no PDA GPU kernels yet)
+    #[clap(long, default_value_t = 0)]
+    #[cfg(feature = "gpu")]
+    pub num_gpus: u32,
+
+    /// Number of cpu threads to use for mining
+    #[clap(long, default_value_t = 0)]
+    pub num_cpus: u32,
+
+    /// Stop once every --pattern has this many matches
+    #[clap(long, default_value_t = 1)]
+    pub count: u32,
+
+    /// Keep collecting each --pattern up to this many while waiting
+    /// for --count. Defaults to --count.
+    #[clap(long)]
+    pub max_count: Option<u32>,
+}
+
+#[derive(Debug, Parser)]
+pub struct VerifyPdaArgs {
+    /// The program id the PDA is derived for
+    #[clap(long, value_parser = parse_pubkey)]
+    pub program_id: Pubkey,
+
+    /// Seed, in order. Repeatable. Formats: str:<utf8>, hex:<bytes>,
+    /// pubkey:<base58>, u64le:<n>, u8:<n>
+    #[clap(long, action = clap::ArgAction::Append)]
+    pub seed: Vec<pda::SeedSpec>,
 }
 
 #[derive(Debug, Parser)]
@@ -470,6 +529,17 @@ impl VanitySpec {
     }
 
     fn live_targets(&self, count: u32, max_count: u32) -> LiveTargets {
+        self.live_targets_scaled(count, max_count, 1.0)
+    }
+
+    /// Like `live_targets`, with the per-attempt probability scaled
+    /// by `prob_factor` (e.g. 0.5 for grind-pda's off-curve discard).
+    fn live_targets_scaled(
+        &self,
+        count: u32,
+        max_count: u32,
+        prob_factor: f64,
+    ) -> LiveTargets {
         LiveTargets {
             count,
             max_count,
@@ -477,11 +547,12 @@ impl VanitySpec {
                 .patterns
                 .iter()
                 .map(|p| {
-                    let probability = bs58_probability(
-                        &p.prefix,
-                        &p.suffix,
-                        self.case_insensitive,
-                    );
+                    let probability = prob_factor
+                        * bs58_probability(
+                            &p.prefix,
+                            &p.suffix,
+                            self.case_insensitive,
+                        );
                     let expected = if probability <= 0.0 {
                         f64::INFINITY
                     } else {
@@ -956,7 +1027,9 @@ fn main() {
         Command::Grind(args) => grind(args),
         Command::GrindKeypair(args) => grind_keypair(args),
         Command::GrindDoppler(args) => grind_doppler(args),
+        Command::GrindPda(args) => grind_pda(args),
         Command::Verify(args) => verify(args),
+        Command::VerifyPda(args) => verify_pda(args),
         #[cfg(feature = "deploy")]
         Command::Deploy(args) => deploy(args),
     }
@@ -1252,6 +1325,183 @@ fn grind(mut args: GrindArgs) {
         format_duration(elapsed),
         (rate as u64).to_formatted_string(&Locale::en)
     );
+}
+
+// ─── grind-pda ──────────────────────────────────────────────────────────────
+
+fn grind_pda(mut args: GrindPdaArgs) {
+    maybe_update_num_cpus(&mut args.num_cpus);
+    let spec = resolve_spec(&args.spec);
+    let (target_count, max_count) =
+        resolve_counts(args.count, args.max_count);
+    let ground_index = pda::validate_layout(
+        &args.seed,
+        &args.grind_prefix,
+        args.grind_index,
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2);
+    });
+    let layout = pda::PdaLayout::new(
+        &args.seed,
+        &args.grind_prefix,
+        ground_index,
+        &args.program_id,
+    );
+    start_grind(spec.patterns.len());
+    // Only bump 255 is hashed; on-curve hits (about half) are
+    // discarded, so the per-attempt probability halves.
+    let live =
+        spec.live_targets_scaled(target_count, max_count, 0.5);
+    #[cfg(feature = "gpu")]
+    if args.num_gpus != 0 {
+        eprintln!("grind-pda is CPU-only; ignoring --num-gpus");
+    }
+    eprintln!("using {} cpus", args.num_cpus);
+    eprintln!("{}", targets_header(target_count, max_count));
+
+    let match_targets = {
+        let pairs = spec.pairs();
+        fast::MatchTargets::new(&pairs, spec.case_insensitive)
+    };
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let grind_start = Instant::now();
+    ui_start(live, grind_start);
+    let reporter = spawn_ui_reporter(Arc::clone(&shutdown));
+
+    let program_id = args.program_id;
+    let layout = &layout;
+    let match_targets = &match_targets;
+    (0..args.num_cpus).into_par_iter().for_each(|i| {
+        let timer = Instant::now();
+        let mut local_batch = 0_u64;
+        let mut template = layout.template();
+        let mut odometer = pda::Odometer::random();
+        let mut ground = [0u8; pda::GROUND_LEN];
+
+        loop {
+            if done(target_count) {
+                if local_batch > 0 {
+                    TOTAL_ATTEMPTS.fetch_add(local_batch, Ordering::Relaxed);
+                }
+                return;
+            }
+
+            odometer.write(&mut ground);
+            odometer.step();
+            template.splice(&ground);
+            let digest = template.digest();
+
+            local_batch += 1;
+            if local_batch >= 4096 {
+                TOTAL_ATTEMPTS.fetch_add(4096, Ordering::Relaxed);
+                local_batch -= 4096;
+            }
+
+            let mask = match_targets
+                .match_mask_active(&digest, unfilled_mask(max_count));
+            // Credit the hit only after the off-curve check passes;
+            // an on-curve bump-255 digest is not this PDA's address.
+            if mask != 0
+                && pda::confirm_hit(layout, &ground, &digest, &program_id)
+                && credit_kinds(mask, max_count)
+            {
+                if local_batch > 0 {
+                    TOTAL_ATTEMPTS.fetch_add(local_batch, Ordering::Relaxed);
+                    local_batch = 0;
+                }
+                let pda_str = fd_bs58::encode_32(digest);
+                let time_secs = timer.elapsed().as_secs_f64();
+                let seeds = layout.seeds_with_ground(&ground);
+                ui_with_match(|| {
+                    eprintln!(
+                        "cpu {i} match: {pda_str} in {:.3}s",
+                        time_secs
+                    );
+                    print_pda_result(&seeds, &pda_str, &program_id);
+                });
+                if done(target_count) {
+                    break;
+                }
+            }
+        }
+    });
+
+    shutdown.store(true, Ordering::SeqCst);
+    reporter.join().unwrap();
+    ui_stop();
+
+    let total = TOTAL_ATTEMPTS.load(Ordering::Relaxed);
+    let elapsed = grind_start
+        .elapsed()
+        .as_secs_f64()
+        .max(1e-9);
+    let rate = total as f64 / elapsed;
+    eprintln!(
+        "done: {} attempts in {} at {} attempts/sec",
+        total.to_formatted_string(&Locale::en),
+        format_duration(elapsed),
+        (rate as u64).to_formatted_string(&Locale::en)
+    );
+}
+
+fn print_pda_seed(index: usize, readable: &str, bytes: &[u8]) {
+    let hex: String = bytes
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    eprintln!("  seed {index}: {readable} (hex {hex})");
+}
+
+fn print_pda_result(
+    seeds: &[Vec<u8>],
+    pda_str: &str,
+    program_id: &Pubkey,
+) {
+    eprintln!("PDA: {pda_str}");
+    eprintln!("bump: 255");
+    eprintln!("program: {program_id}");
+    for (i, s) in seeds.iter().enumerate() {
+        match core::str::from_utf8(s) {
+            Ok(t)
+                if s.iter()
+                    .all(|&b| (0x20..0x7f).contains(&b)) =>
+            {
+                print_pda_seed(i, &format!("\"{t}\""), s)
+            }
+            _ => print_pda_seed(i, "(binary)", s),
+        }
+    }
+    eprintln!("{}", pda::snippet(seeds));
+}
+
+fn verify_pda(args: VerifyPdaArgs) {
+    assert!(
+        args.seed.len() <= pda::MAX_USER_SEEDS,
+        "at most {} --seed flags",
+        pda::MAX_USER_SEEDS
+    );
+    let seeds: Vec<&[u8]> = args
+        .seed
+        .iter()
+        .map(|s| s.bytes.as_slice())
+        .collect();
+    let (pda, bump) =
+        Pubkey::find_program_address(&seeds, &args.program_id);
+    println!("Results:");
+    println!("  program {}", args.program_id);
+    for (i, s) in args.seed.iter().enumerate() {
+        let hex: String = s
+            .bytes
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        println!("  seed {i}: {} (hex {hex})", s.raw);
+    }
+    println!();
+    println!("  resulting PDA: {pda}");
+    println!("  bump: {bump}");
 }
 
 // ─── grind-keypair ──────────────────────────────────────────────────────────
@@ -1896,6 +2146,30 @@ mod tests {
                 prefix: "Harmonic".into(),
                 suffix: String::new(),
             }
+        );
+    }
+
+    #[test]
+    fn live_targets_scaled_halves_probability() {
+        let spec = VanitySpec {
+            patterns: vec![VanityPattern {
+                prefix: "ab".into(),
+                suffix: String::new(),
+            }],
+            case_insensitive: false,
+        };
+        let base = spec.live_targets(1, 1);
+        let scaled = spec.live_targets_scaled(1, 1, 0.5);
+        let b = &base.rows[0];
+        let s = &scaled.rows[0];
+        assert!(
+            (s.probability - b.probability / 2.0).abs() < 1e-30,
+            "probability should halve"
+        );
+        assert!(
+            ((s.expected - b.expected * 2.0) / b.expected).abs()
+                < 1e-12,
+            "expected attempts should double"
         );
     }
 
