@@ -49,7 +49,10 @@ num-traits = "0.2"
 rand = "0.8.5"
 rayon = "1.10.0"
 sha2 = "0.10.8"
-solana-pubkey = { version = "2.1.0", features = ["sha2"] }
+solana-pubkey = { version = "2.1.0", features = [
+    "sha2",
+    "curve25519",
+] }
 solana-rpc-client = { version = "2.1.0", optional = true }
 solana-sdk = { version = "2.1.0", optional = true }
 

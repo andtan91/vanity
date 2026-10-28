@@ -1,4 +1,5 @@
 mod fast;
+mod pda;
 
 #[cfg(all(feature = "metal", not(target_os = "macos")))]
 compile_error!("the metal feature requires macOS");
