@@ -479,6 +479,137 @@ mod tests {
         );
     }
 
+    // ── known-answer vectors (program T1TAN…, verified with solders) ──
+
+    /// Build the bump-255 digest for a full 16-byte seed string, as
+    /// the grind loop would (empty grind prefix, seed = ground bytes).
+    fn kat_digest(seed16: &[u8; GROUND_LEN]) -> [u8; 32] {
+        let layout = PdaLayout::new(&[], "", 0, &program());
+        let mut tpl = layout.template();
+        tpl.splice(seed16);
+        tpl.digest()
+    }
+
+    #[test]
+    fn kat_off_curve_hit_is_accepted() {
+        let digest = kat_digest(b"theia_06bd29104c");
+        // Off-curve at bump 255: create_program_address succeeds and
+        // agrees with the template digest.
+        let pda = Pubkey::create_program_address(
+            &[b"theia_06bd29104c", &[BUMP]],
+            &program(),
+        )
+        .expect("bump 255 must be off-curve");
+        assert_eq!(pda.to_bytes(), digest);
+        assert_eq!(
+            pda.to_string(),
+            "theiaHDzo8w65CTkRxCYAb7KTMVqcUtff4KUv3oRAD4"
+        );
+        let targets =
+            crate::fast::MatchTargets::new(&[("theia", "")], false);
+        assert_ne!(targets.match_mask(&digest), 0);
+    }
+
+    #[test]
+    fn kat_on_curve_hit_is_rejected() {
+        // Bump 255 lands on the curve: the raw digest must be
+        // discarded even though find_program_address would give a
+        // different canonical (bump 254) address.
+        let err = Pubkey::create_program_address(
+            &[b"theia_051de97e00", &[BUMP]],
+            &program(),
+        );
+        assert!(err.is_err(), "bump 255 must be on-curve here");
+        let (pda, bump) = Pubkey::find_program_address(
+            &[b"theia_051de97e00"],
+            &program(),
+        );
+        assert_eq!(bump, 254);
+        assert_eq!(
+            pda.to_string(),
+            "3kVDLZM5sDknPijr5Rj8d2rbfviEzvmwougAgtSQnXkr"
+        );
+    }
+
+    #[test]
+    fn kat_near_misses_do_not_match() {
+        // These bump-255 digests share the leading 32 bits with
+        // theia… addresses but encode to theiZ… / theib…; a sloppy
+        // numeric prefix filter would wrongly accept them.
+        let targets =
+            crate::fast::MatchTargets::new(&[("theia", "")], false);
+        for seed in [b"theia_0165b53a8a", b"theia_018d620d53"] {
+            let digest = kat_digest(seed);
+            let encoded = fd_bs58::encode_32(digest);
+            assert!(encoded.starts_with("thei"), "{encoded}");
+            assert!(!encoded.starts_with("theia"), "{encoded}");
+            assert_eq!(targets.match_mask(&digest), 0, "{encoded}");
+        }
+    }
+
+    // ── matcher agreement on random digests ──
+
+    fn splitmix64(x: &mut u64) -> u64 {
+        *x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    #[test]
+    fn match_targets_agree_with_full_encode_on_random_digests() {
+        // Prefixes with leading '1' (zero bytes) and high first chars
+        // that only occur in 43-char encodings (like 't'), plus a
+        // suffix: the digest-level matcher must agree with a full
+        // base58 encode on every one.
+        let pairs: &[(&str, &str)] = &[
+            ("t", ""),
+            ("theia", ""),
+            ("1a", ""),
+            ("11", ""),
+            ("Zz", ""),
+            ("", "ab"),
+        ];
+        let targets = crate::fast::MatchTargets::new(pairs, false);
+        let n: u64 = if cfg!(debug_assertions) {
+            100_000
+        } else {
+            1_000_000
+        };
+        let mut state = 0xC0FF_EE11_D15E_A5E5u64;
+        for i in 0..n {
+            let mut digest = [0u8; 32];
+            for w in 0..4 {
+                digest[w * 8..w * 8 + 8].copy_from_slice(
+                    &splitmix64(&mut state).to_be_bytes(),
+                );
+            }
+            // Leading-zero digests are astronomically rare at random;
+            // force some so the '1'-prefix patterns get exercised.
+            match i % 97 {
+                0 => digest[0] = 0,
+                1 => {
+                    digest[0] = 0;
+                    digest[1] = 0;
+                }
+                _ => {}
+            }
+            let encoded = fd_bs58::encode_32(digest);
+            let mut want = 0u64;
+            for (k, (p, s)) in pairs.iter().enumerate() {
+                if encoded.starts_with(p) && encoded.ends_with(s) {
+                    want |= 1 << k;
+                }
+            }
+            assert_eq!(
+                targets.match_mask(&digest),
+                want,
+                "digest {i}: {encoded}"
+            );
+        }
+    }
+
     #[test]
     fn seeds_with_ground_inserts_at_index() {
         let fixed = [seed("str:pool"), seed("u8:3")];
