@@ -63,6 +63,11 @@ impl FromStr for SeedSpec {
 }
 
 fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
+    if !value.is_ascii() {
+        return Err(format!(
+            "--seed hex '{value}' is not valid hex"
+        ));
+    }
     if !value.len().is_multiple_of(2) {
         return Err(format!("--seed hex '{value}' has odd length"));
     }
@@ -440,6 +445,41 @@ mod tests {
     }
 
     #[test]
+    fn template_nonzero_midstate() {
+        // Two 32-byte seeds put the ground bytes at offset 64:
+        // exactly one whole block is folded into the midstate.
+        let fixed = [
+            seed(&format!("pubkey:{T1TAN}")),
+            seed(&format!("pubkey:{T1TAN}")),
+        ];
+        assert_matches_reference(
+            &fixed,
+            "",
+            2,
+            b"midstate12345678",
+        );
+    }
+
+    #[test]
+    fn template_nonzero_midstate_and_straddled_ground() {
+        // 64 + 32 + 28 fixed bytes put the ground at offset
+        // 124..140: one block in the midstate AND the ground bytes
+        // crossing a block boundary inside the tail.
+        let fixed = [
+            seed(&format!("pubkey:{T1TAN}")),
+            seed(&format!("pubkey:{T1TAN}")),
+            seed(&format!("str:{}", "a".repeat(32))),
+            seed(&format!("str:{}", "b".repeat(28))),
+        ];
+        assert_matches_reference(
+            &fixed,
+            "",
+            4,
+            b"straddle87654321",
+        );
+    }
+
+    #[test]
     fn template_long_tail_many_blocks() {
         // Ground seed first: the whole multi-block message is tail.
         let fixed: Vec<SeedSpec> = (0..8)
@@ -757,6 +797,13 @@ mod tests {
     #[test]
     fn rejects_non_hex_chars() {
         assert!("hex:zz".parse::<SeedSpec>().is_err());
+    }
+
+    #[test]
+    fn rejects_non_ascii_hex_without_panicking() {
+        // Multi-byte chars must not panic the byte-offset slicing.
+        assert!("hex:€5".parse::<SeedSpec>().is_err());
+        assert!("hex:aé".parse::<SeedSpec>().is_err());
     }
 
     #[test]
