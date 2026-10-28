@@ -1352,8 +1352,7 @@ fn grind_pda(mut args: GrindPdaArgs) {
     start_grind(spec.patterns.len());
     // Only bump 255 is hashed; on-curve hits (about half) are
     // discarded, so the per-attempt probability halves.
-    let live =
-        spec.live_targets_scaled(target_count, max_count, 0.5);
+    let live = spec.live_targets_scaled(target_count, max_count, 0.5);
     #[cfg(feature = "gpu")]
     if args.num_gpus != 0 {
         eprintln!("grind-pda is CPU-only; ignoring --num-gpus");
@@ -1373,60 +1372,71 @@ fn grind_pda(mut args: GrindPdaArgs) {
     let program_id = args.program_id;
     let layout = &layout;
     let match_targets = &match_targets;
-    (0..args.num_cpus).into_par_iter().for_each(|i| {
-        let timer = Instant::now();
-        let mut local_batch = 0_u64;
-        let mut template = layout.template();
-        let mut odometer = pda::Odometer::random();
-        let mut ground = [0u8; pda::GROUND_LEN];
+    (0..args.num_cpus)
+        .into_par_iter()
+        .for_each(|i| {
+            let timer = Instant::now();
+            let mut local_batch = 0_u64;
+            let mut template = layout.template();
+            let mut odometer = pda::Odometer::random();
+            let mut ground = [0u8; pda::GROUND_LEN];
 
-        loop {
-            if done(target_count) {
-                if local_batch > 0 {
-                    TOTAL_ATTEMPTS.fetch_add(local_batch, Ordering::Relaxed);
-                }
-                return;
-            }
-
-            odometer.write(&mut ground);
-            odometer.step();
-            template.splice(&ground);
-            let digest = template.digest();
-
-            local_batch += 1;
-            if local_batch >= 4096 {
-                TOTAL_ATTEMPTS.fetch_add(4096, Ordering::Relaxed);
-                local_batch -= 4096;
-            }
-
-            let mask = match_targets
-                .match_mask_active(&digest, unfilled_mask(max_count));
-            // Credit the hit only after the off-curve check passes;
-            // an on-curve bump-255 digest is not this PDA's address.
-            if mask != 0
-                && pda::confirm_hit(layout, &ground, &digest, &program_id)
-                && credit_kinds(mask, max_count)
-            {
-                if local_batch > 0 {
-                    TOTAL_ATTEMPTS.fetch_add(local_batch, Ordering::Relaxed);
-                    local_batch = 0;
-                }
-                let pda_str = fd_bs58::encode_32(digest);
-                let time_secs = timer.elapsed().as_secs_f64();
-                let seeds = layout.seeds_with_ground(&ground);
-                ui_with_match(|| {
-                    eprintln!(
-                        "cpu {i} match: {pda_str} in {:.3}s",
-                        time_secs
-                    );
-                    print_pda_result(&seeds, &pda_str, &program_id);
-                });
+            loop {
                 if done(target_count) {
-                    break;
+                    if local_batch > 0 {
+                        TOTAL_ATTEMPTS
+                            .fetch_add(local_batch, Ordering::Relaxed);
+                    }
+                    return;
+                }
+
+                odometer.write(&mut ground);
+                odometer.step();
+                template.splice(&ground);
+                let digest = template.digest();
+
+                local_batch += 1;
+                if local_batch >= 4096 {
+                    TOTAL_ATTEMPTS.fetch_add(4096, Ordering::Relaxed);
+                    local_batch -= 4096;
+                }
+
+                let mask = match_targets.match_mask_active(
+                    &digest,
+                    unfilled_mask(max_count),
+                );
+                // Credit the hit only after the off-curve check passes;
+                // an on-curve bump-255 digest is not this PDA's address.
+                if mask != 0
+                    && pda::confirm_hit(
+                        layout,
+                        &ground,
+                        &digest,
+                        &program_id,
+                    )
+                    && credit_kinds(mask, max_count)
+                {
+                    if local_batch > 0 {
+                        TOTAL_ATTEMPTS
+                            .fetch_add(local_batch, Ordering::Relaxed);
+                        local_batch = 0;
+                    }
+                    let pda_str = fd_bs58::encode_32(digest);
+                    let time_secs = timer.elapsed().as_secs_f64();
+                    let seeds = layout.seeds_with_ground(&ground);
+                    ui_with_match(|| {
+                        eprintln!(
+                            "cpu {i} match: {pda_str} in {:.3}s",
+                            time_secs
+                        );
+                        print_pda_result(&seeds, &pda_str, &program_id);
+                    });
+                    if done(target_count) {
+                        break;
+                    }
                 }
             }
-        }
-    });
+        });
 
     shutdown.store(true, Ordering::SeqCst);
     reporter.join().unwrap();

@@ -50,11 +50,12 @@ If you don't have a GPU, consider using [vast.ai](https://cloud.vast.ai/?ref_id=
 
 ## Usage
 
-vanity grinds three kinds of vanity output. All three share the same mining flags (`--num-cpus`, `--num-gpus`, `--count`, and for pattern grinds `--max-count`) described in [Common options](#common-options).
+vanity grinds four kinds of vanity output. All share the same mining flags (`--num-cpus`, `--num-gpus`, `--count`, and for pattern grinds `--max-count`) described in [Common options](#common-options).
 
 | Command | Produces | How the address is derived | Speed |
 | --- | --- | --- | --- |
 | [`grind`](#grind-a-vanity-seed) | a **seed** for `CreateAccountWithSeed` | `base58(SHA256(base ‖ seed ‖ owner))` | fastest (SHA-256 only) |
+| [`grind-pda`](#grind-a-vanity-pda) | a **seed** for `find_program_address` | `base58(SHA256(seeds ‖ [255] ‖ program_id ‖ "ProgramDerivedAddress"))`, off-curve only | fast (SHA-256 per attempt; CPU only, for now) |
 | [`grind-keypair`](#grind-a-vanity-keypair) | an **ed25519 keypair** | `base58(ed25519_pubkey(seed))` | slower (ed25519 per attempt) |
 | [`grind-doppler`](#grind-a-doppler-keypair) | an **ed25519 keypair** with sign-extendable segments | `ed25519_pubkey(seed)`, matched on bytes | slower (ed25519 per attempt) |
 
@@ -194,17 +195,65 @@ doppler: 1/4 sign-extendable segment(s)
   ...
 ```
 
+### Grind a vanity PDA
+
+`grind-pda` searches for a seed such that
+`Pubkey::find_program_address(seeds, program_id)` yields an address matching
+your `--pattern`s (same syntax and `--count`/`--max-count`/`--case-insensitive`
+semantics as `grind`). It is CPU only for now; `--num-gpus` is ignored.
+
+The ground seed is `--grind-prefix` plus 16 random alphanumeric characters,
+and can sit anywhere among your fixed `--seed`s (`--grind-index`, default:
+last). Seeds take typed specs: `str:<utf8>`, `hex:<bytes>`,
+`pubkey:<base58>`, `u64le:<n>`, `u8:<n>`.
+
+Only bump 255 is hashed. A pattern hit whose bump-255 point lands **on** the
+ed25519 curve is discarded — its canonical bump would differ, giving a
+different address — so expected attempts are 2× the plain base58 odds (the
+live probability/ETA display already accounts for this). About half of all
+seeds survive, and every reported hit is the **canonical** PDA with bump 255.
+
+```bash
+vanity grind-pda \
+  --program-id T1TANpTeScyeqVzzgNViGDNrkQ6qHz9KrSBS4aNXvGT \
+  --grind-prefix theia_ \
+  --pattern theia...
+```
+
+On a match it prints the PDA, the bump, every seed (readable + hex), and a
+paste-ready snippet:
+
+```text
+cpu 0 match: theia...D4 in 12.3s
+PDA: theiaHDzo8w65CTkRxCYAb7KTMVqcUtff4KUv3oRAD4
+bump: 255
+program: T1TANpTeScyeqVzzgNViGDNrkQ6qHz9KrSBS4aNXvGT
+  seed 0: "theia_06bd29104c" (hex 74686569615f3036626432393130346335)
+create_program_address(&[b"theia_06bd29104c", &[255]], &ID)
+```
+
+Recompute any PDA (canonical bump included) with `verify-pda`:
+
+```bash
+vanity verify-pda \
+  --program-id T1TANpTeScyeqVzzgNViGDNrkQ6qHz9KrSBS4aNXvGT \
+  --seed str:theia_06bd29104c
+```
+
 ### Common options
 
 | Flag | Applies to | Default | Meaning |
 | --- | --- | --- | --- |
 | `--num-cpus <N>` | all | `0` (= all logical cores) | CPU mining threads |
-| `--num-gpus <N>` | all (GPU builds only) | `1` | GPUs to mine on |
-| `--count <N>` | `grind`, `grind-keypair` | `1` | stop once **every** `--pattern` has N matches |
-| `--max-count <N>` | `grind`, `grind-keypair` | `--count` | keep saving each `--pattern` up to N while waiting; then drop that kind from the search |
+| `--num-gpus <N>` | all but `grind-pda` (GPU builds only) | `1` | GPUs to mine on (`grind-pda` is CPU only and ignores it) |
+| `--count <N>` | `grind`, `grind-pda`, `grind-keypair` | `1` | stop once **every** `--pattern` has N matches |
+| `--max-count <N>` | `grind`, `grind-pda`, `grind-keypair` | `--count` | keep saving each `--pattern` up to N while waiting; then drop that kind from the search |
 | `--count <N>` | `grind-doppler` | `1` | stop after N matching keypairs |
-| `--case-insensitive` | `grind`, `grind-keypair` | off | match patterns ignoring case |
-| `--pattern` | `grind`, `grind-keypair` | — | repeatable `Prefix...Suffix` / `Prefix...` / `...Suffix`; a hit matches any unfilled kind |
+| `--case-insensitive` | `grind`, `grind-pda`, `grind-keypair` | off | match patterns ignoring case |
+| `--pattern` | `grind`, `grind-pda`, `grind-keypair` | — | repeatable `Prefix...Suffix` / `Prefix...` / `...Suffix`; a hit matches any unfilled kind |
+| `--seed <SPEC>` | `grind-pda`, `verify-pda` | — | repeatable fixed seed: `str:` / `hex:` / `pubkey:` / `u64le:` / `u8:` |
+| `--grind-prefix <STR>` | `grind-pda` | empty | fixed ASCII prefix inside the ground seed |
+| `--grind-index <N>` | `grind-pda` | last | position of the ground seed among the seeds |
 | `--segments <1-4>` | `grind-doppler` | `1` | sign-extendable segments required |
 
 To run purely on CPU (no GPU), build without a GPU feature, or pass `--num-gpus 0`.
@@ -227,6 +276,8 @@ Approximate single-device throughput:
 Metal keypair throughput is `grind-doppler` on this machine (`--num-gpus 1 --num-cpus 1`): about 36M keys/s, versus about 13M keys/s for the OpenCL backend on the same GPU. The kernel is a width-12 affine comb stored as 128-byte records (one cache line per table entry). `fe_mul`, `fe_sq`, and the 32-byte SHA-512 stay real calls so their temporaries do not spill the comb.
 
 `grind` is far faster because each attempt is just a SHA-256 hash. Keypair modes (`grind-keypair`/`grind-doppler`) perform full sha512 and ed25519 scalar multiplication per attempt. Throughput scales roughly linearly with `--num-gpus`.
+
+`grind-pda` (CPU only) hashes from a precomputed SHA-256 midstate and matches patterns on the raw digest (base58 is only encoded on candidate hits); the off-curve check runs only on pattern hits. On an Apple M3 it does about 3.6M attempts/s on one core and about 20M attempts/s across 8 cores.
 
 
 ## Acknowledgements, External Libraries

@@ -63,10 +63,8 @@ impl FromStr for SeedSpec {
 }
 
 fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
-    if value.len() % 2 != 0 {
-        return Err(format!(
-            "--seed hex '{value}' has odd length"
-        ));
+    if !value.len().is_multiple_of(2) {
+        return Err(format!("--seed hex '{value}' has odd length"));
     }
     (0..value.len())
         .step_by(2)
@@ -153,8 +151,10 @@ const SHA256_IV: [u32; 8] = [
     0x5be0_cd19,
 ];
 
-type Sha256Block =
-    sha2::digest::generic_array::GenericArray<u8, sha2::digest::consts::U64>;
+type Sha256Block = sha2::digest::generic_array::GenericArray<
+    u8,
+    sha2::digest::consts::U64,
+>;
 
 impl PdaLayout {
     pub fn new(
@@ -286,8 +286,10 @@ pub fn confirm_hit(
     program_id: &Pubkey,
 ) -> bool {
     let seeds = layout.seeds_with_ground(ground);
-    let mut refs: Vec<&[u8]> =
-        seeds.iter().map(|s| s.as_slice()).collect();
+    let mut refs: Vec<&[u8]> = seeds
+        .iter()
+        .map(|s| s.as_slice())
+        .collect();
     let bump = [BUMP];
     refs.push(&bump);
     match Pubkey::create_program_address(&refs, program_id) {
@@ -302,12 +304,10 @@ pub fn snippet(seeds: &[Vec<u8>]) -> String {
         .iter()
         .map(|s| {
             if !s.is_empty()
-                && s.iter().all(|&b| (0x20..0x7f).contains(&b))
+                && s.iter()
+                    .all(|&b| (0x20..0x7f).contains(&b))
             {
-                format!(
-                    "b\"{}\"",
-                    core::str::from_utf8(s).unwrap()
-                )
+                format!("b\"{}\"", core::str::from_utf8(s).unwrap())
             } else {
                 let bytes: Vec<String> = s
                     .iter()
@@ -318,10 +318,7 @@ pub fn snippet(seeds: &[Vec<u8>]) -> String {
         })
         .collect();
     parts.push(format!("&[{BUMP}]"));
-    format!(
-        "create_program_address(&[{}], &ID)",
-        parts.join(", ")
-    )
+    format!("create_program_address(&[{}], &ID)", parts.join(", "))
 }
 
 /// Same 62-char alphabet as `grind`'s random seeds.
@@ -410,12 +407,7 @@ mod tests {
 
     #[test]
     fn template_ground_with_prefix() {
-        assert_matches_reference(
-            &[],
-            "theia_",
-            0,
-            b"ZZZZZZZZZZZZZZZZ",
-        );
+        assert_matches_reference(&[], "theia_", 0, b"ZZZZZZZZZZZZZZZZ");
     }
 
     #[test]
@@ -453,12 +445,7 @@ mod tests {
         let fixed: Vec<SeedSpec> = (0..8)
             .map(|_| seed(&format!("pubkey:{T1TAN}")))
             .collect();
-        assert_matches_reference(
-            &fixed,
-            "",
-            0,
-            b"A1B2C3D4E5F6G7H8",
-        );
+        assert_matches_reference(&fixed, "", 0, b"A1B2C3D4E5F6G7H8");
     }
 
     #[test]
@@ -740,10 +727,12 @@ mod tests {
 
     #[test]
     fn parses_pubkey_seed() {
-        let s = seed("pubkey:T1TANpTeScyeqVzzgNViGDNrkQ6qHz9KrSBS4aNXvGT");
-        let pk =
-            Pubkey::from_str("T1TANpTeScyeqVzzgNViGDNrkQ6qHz9KrSBS4aNXvGT")
-                .unwrap();
+        let s =
+            seed("pubkey:T1TANpTeScyeqVzzgNViGDNrkQ6qHz9KrSBS4aNXvGT");
+        let pk = Pubkey::from_str(
+            "T1TANpTeScyeqVzzgNViGDNrkQ6qHz9KrSBS4aNXvGT",
+        )
+        .unwrap();
         assert_eq!(s.bytes, pk.to_bytes().to_vec());
     }
 
@@ -777,7 +766,9 @@ mod tests {
 
     #[test]
     fn rejects_unknown_kind() {
-        assert!("base64:AAAA".parse::<SeedSpec>().is_err());
+        assert!("base64:AAAA"
+            .parse::<SeedSpec>()
+            .is_err());
     }
 
     #[test]
@@ -816,8 +807,8 @@ mod tests {
     #[test]
     fn layout_rejects_long_grind_prefix() {
         // 16 ground chars + 17-byte prefix > 32-byte seed limit.
-        let err = validate_layout(&[], &"a".repeat(17), None)
-            .unwrap_err();
+        let err =
+            validate_layout(&[], &"a".repeat(17), None).unwrap_err();
         assert!(err.contains("--grind-prefix"), "{err}");
         assert!(validate_layout(&[], &"a".repeat(16), None).is_ok());
     }
