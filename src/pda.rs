@@ -275,6 +275,48 @@ impl PdaTemplate {
     }
 }
 
+/// Same 62-char alphabet as `grind`'s random seeds.
+pub const ALNUM: &[u8; 62] =
+    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+/// Per-thread ground-seed stepper: a random base-62 odometer. No RNG
+/// in the hot loop; a random start keeps seeds unpredictable across
+/// runs and threads while the counter walk covers the space.
+pub struct Odometer {
+    idx: [u8; GROUND_LEN],
+}
+
+impl Odometer {
+    pub fn random() -> Self {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        Self {
+            idx: std::array::from_fn(|_| rng.gen_range(0..62)),
+        }
+    }
+
+    /// Render the current position as 16 alnum bytes.
+    #[inline]
+    pub fn write(&self, out: &mut [u8; GROUND_LEN]) {
+        for i in 0..GROUND_LEN {
+            out[i] = ALNUM[self.idx[i] as usize];
+        }
+    }
+
+    /// Advance one position (base-62, carries right to left).
+    #[inline]
+    pub fn step(&mut self) {
+        for i in (0..GROUND_LEN).rev() {
+            self.idx[i] += 1;
+            if self.idx[i] == 62 {
+                self.idx[i] = 0;
+            } else {
+                return;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,6 +425,58 @@ mod tests {
         hasher.update(PDA_MARKER);
         let want: [u8; 32] = hasher.finalize().into();
         assert_eq!(tpl.digest(), want);
+    }
+
+    fn odo(idx: [u8; GROUND_LEN]) -> Odometer {
+        Odometer { idx }
+    }
+
+    fn rendered(o: &Odometer) -> [u8; GROUND_LEN] {
+        let mut out = [0u8; GROUND_LEN];
+        o.write(&mut out);
+        out
+    }
+
+    #[test]
+    fn odometer_bytes_are_alnum() {
+        let o = Odometer::random();
+        for b in rendered(&o) {
+            assert!(ALNUM.contains(&b), "{b} not alnum");
+        }
+    }
+
+    #[test]
+    fn odometer_step_increments_last_position() {
+        let mut o = odo([0; GROUND_LEN]);
+        assert_eq!(&rendered(&o), b"0000000000000000");
+        o.step();
+        assert_eq!(&rendered(&o), b"0000000000000001");
+    }
+
+    #[test]
+    fn odometer_step_carries() {
+        let mut idx = [0u8; GROUND_LEN];
+        idx[15] = 61;
+        let mut o = odo(idx);
+        assert_eq!(&rendered(&o), b"000000000000000z");
+        o.step();
+        assert_eq!(&rendered(&o), b"0000000000000010");
+    }
+
+    #[test]
+    fn odometer_full_wrap() {
+        let mut o = odo([61; GROUND_LEN]);
+        o.step();
+        assert_eq!(&rendered(&o), b"0000000000000000");
+    }
+
+    #[test]
+    fn odometer_random_instances_differ() {
+        // 62^-16 collision odds; a failure here means a broken RNG.
+        assert_ne!(
+            rendered(&Odometer::random()),
+            rendered(&Odometer::random())
+        );
     }
 
     #[test]
