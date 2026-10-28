@@ -115,12 +115,289 @@ pub fn validate_layout(
     Ok(index)
 }
 
+/// Marker appended after the program id in the PDA preimage.
+pub const PDA_MARKER: &[u8; 21] = b"ProgramDerivedAddress";
+/// The only bump this grinder hashes with (canonical-first policy:
+/// on-curve hits are discarded, never re-searched at lower bumps).
+pub const BUMP: u8 = 255;
+
+/// Fixed PDA preimage layout for one grind:
+/// `seeds[..] ‖ [255] ‖ program_id ‖ b"ProgramDerivedAddress"`, with
+/// the ground seed (`grind_prefix ‖ 16 alnum bytes`) at `ground_index`.
+/// Precomputes a SHA-256 midstate over every whole 64-byte block
+/// before the 16 ground bytes; per-attempt work is splicing those 16
+/// bytes into the padded tail and compressing the remaining blocks.
+pub struct PdaLayout {
+    fixed: Vec<SeedSpec>,
+    grind_prefix: Vec<u8>,
+    ground_index: usize,
+    template: PdaTemplate,
+}
+
+/// Per-thread spliceable hash state: midstate + padded tail blocks.
+#[derive(Clone)]
+pub struct PdaTemplate {
+    midstate: [u32; 8],
+    tail: Vec<u8>,
+    splice_off: usize,
+}
+
+const SHA256_IV: [u32; 8] = [
+    0x6a09_e667,
+    0xbb67_ae85,
+    0x3c6e_f372,
+    0xa54f_f53a,
+    0x510e_527f,
+    0x9b05_688c,
+    0x1f83_d9ab,
+    0x5be0_cd19,
+];
+
+type Sha256Block =
+    sha2::digest::generic_array::GenericArray<u8, sha2::digest::consts::U64>;
+
+impl PdaLayout {
+    pub fn new(
+        fixed: &[SeedSpec],
+        grind_prefix: &str,
+        ground_index: usize,
+        program_id: &Pubkey,
+    ) -> Self {
+        assert!(ground_index <= fixed.len(), "ground index");
+        assert!(
+            grind_prefix.len() + GROUND_LEN <= MAX_SEED_LEN,
+            "ground seed too long"
+        );
+
+        let mut message = Vec::new();
+        let mut ground_off = 0usize;
+        for (i, s) in fixed
+            .iter()
+            .map(|s| s.bytes.as_slice())
+            .take(ground_index)
+            .chain([&[] as &[u8]]) // placeholder slot
+            .chain(
+                fixed
+                    .iter()
+                    .map(|s| s.bytes.as_slice())
+                    .skip(ground_index),
+            )
+            .enumerate()
+        {
+            if i == ground_index {
+                message.extend_from_slice(grind_prefix.as_bytes());
+                ground_off = message.len();
+                message.extend_from_slice(&[0u8; GROUND_LEN]);
+            } else {
+                message.extend_from_slice(s);
+            }
+        }
+        message.push(BUMP);
+        message.extend_from_slice(program_id.as_ref());
+        message.extend_from_slice(PDA_MARKER);
+
+        // Midstate over every whole block before the ground bytes.
+        let prefix_blocks = ground_off / 64;
+        let mut midstate = SHA256_IV;
+        for block in message[..prefix_blocks * 64].chunks_exact(64) {
+            sha2::compress256(
+                &mut midstate,
+                core::slice::from_ref(Sha256Block::from_slice(block)),
+            );
+        }
+
+        // Tail = rest of the message plus standard SHA-256 padding.
+        let mut tail = message[prefix_blocks * 64..].to_vec();
+        let bit_len = (message.len() as u64) * 8;
+        tail.push(0x80);
+        while tail.len() % 64 != 56 {
+            tail.push(0);
+        }
+        tail.extend_from_slice(&bit_len.to_be_bytes());
+
+        Self {
+            fixed: fixed.to_vec(),
+            grind_prefix: grind_prefix.as_bytes().to_vec(),
+            ground_index,
+            template: PdaTemplate {
+                midstate,
+                tail,
+                splice_off: ground_off - prefix_blocks * 64,
+            },
+        }
+    }
+
+    pub fn template(&self) -> PdaTemplate {
+        self.template.clone()
+    }
+
+    /// Full seed list (bytes) with `grind_prefix ‖ ground` inserted,
+    /// for `create_program_address` cross-checks and display.
+    pub fn seeds_with_ground(
+        &self,
+        ground: &[u8; GROUND_LEN],
+    ) -> Vec<Vec<u8>> {
+        let mut seeds: Vec<Vec<u8>> = self
+            .fixed
+            .iter()
+            .map(|s| s.bytes.clone())
+            .collect();
+        let mut ground_seed = self.grind_prefix.clone();
+        ground_seed.extend_from_slice(ground);
+        seeds.insert(self.ground_index, ground_seed);
+        seeds
+    }
+}
+
+impl PdaTemplate {
+    /// Write the 16 ground bytes into the message tail.
+    #[inline]
+    pub fn splice(&mut self, ground: &[u8; GROUND_LEN]) {
+        self.tail[self.splice_off..self.splice_off + GROUND_LEN]
+            .copy_from_slice(ground);
+    }
+
+    /// SHA-256 of the full PDA preimage with the spliced ground bytes.
+    #[inline]
+    pub fn digest(&self) -> [u8; 32] {
+        let mut state = self.midstate;
+        for block in self.tail.chunks_exact(64) {
+            sha2::compress256(
+                &mut state,
+                core::slice::from_ref(Sha256Block::from_slice(block)),
+            );
+        }
+        let mut out = [0u8; 32];
+        for (i, w) in state.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&w.to_be_bytes());
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
+
+    const T1TAN: &str = "T1TANpTeScyeqVzzgNViGDNrkQ6qHz9KrSBS4aNXvGT";
 
     fn seed(s: &str) -> SeedSpec {
         s.parse().unwrap()
+    }
+
+    fn program() -> Pubkey {
+        Pubkey::from_str(T1TAN).unwrap()
+    }
+
+    fn assert_matches_reference(
+        fixed: &[SeedSpec],
+        prefix: &str,
+        index: usize,
+        ground: &[u8; GROUND_LEN],
+    ) {
+        let prog = program();
+        let layout = PdaLayout::new(fixed, prefix, index, &prog);
+        let mut tpl = layout.template();
+        tpl.splice(ground);
+
+        let mut hasher = Sha256::new();
+        for s in layout.seeds_with_ground(ground) {
+            hasher.update(&s);
+        }
+        hasher.update([BUMP]);
+        hasher.update(prog);
+        hasher.update(PDA_MARKER);
+        let want: [u8; 32] = hasher.finalize().into();
+        assert_eq!(tpl.digest(), want);
+    }
+
+    #[test]
+    fn template_ground_only() {
+        assert_matches_reference(&[], "", 0, b"0123456789abcdef");
+    }
+
+    #[test]
+    fn template_ground_with_prefix() {
+        assert_matches_reference(
+            &[],
+            "theia_",
+            0,
+            b"ZZZZZZZZZZZZZZZZ",
+        );
+    }
+
+    #[test]
+    fn template_ground_first_middle_last() {
+        let fixed = [seed(&format!("pubkey:{T1TAN}")), seed("u64le:7")];
+        for index in 0..=2 {
+            assert_matches_reference(
+                &fixed,
+                "v_",
+                index,
+                b"abcdefghij012345",
+            );
+        }
+    }
+
+    #[test]
+    fn template_ground_straddles_block_boundary() {
+        // 32 + 12 fixed bytes + 16-byte prefix puts the ground bytes
+        // at message offset 60..76, across the first 64-byte block.
+        let fixed = [
+            seed(&format!("str:{}", "a".repeat(32))),
+            seed(&format!("str:{}", "b".repeat(12))),
+        ];
+        assert_matches_reference(
+            &fixed,
+            &"p".repeat(16),
+            2,
+            b"qrstuvwxyz987654",
+        );
+    }
+
+    #[test]
+    fn template_long_tail_many_blocks() {
+        // Ground seed first: the whole multi-block message is tail.
+        let fixed: Vec<SeedSpec> = (0..8)
+            .map(|_| seed(&format!("pubkey:{T1TAN}")))
+            .collect();
+        assert_matches_reference(
+            &fixed,
+            "",
+            0,
+            b"A1B2C3D4E5F6G7H8",
+        );
+    }
+
+    #[test]
+    fn template_resplice_overwrites() {
+        let layout = PdaLayout::new(&[], "theia_", 0, &program());
+        let mut tpl = layout.template();
+        tpl.splice(b"0000000000000000");
+        tpl.splice(b"06bd29104c000000");
+        let mut hasher = Sha256::new();
+        hasher.update(b"theia_06bd29104c000000");
+        hasher.update([BUMP]);
+        hasher.update(program());
+        hasher.update(PDA_MARKER);
+        let want: [u8; 32] = hasher.finalize().into();
+        assert_eq!(tpl.digest(), want);
+    }
+
+    #[test]
+    fn seeds_with_ground_inserts_at_index() {
+        let fixed = [seed("str:pool"), seed("u8:3")];
+        let layout = PdaLayout::new(&fixed, "x_", 1, &program());
+        let seeds = layout.seeds_with_ground(b"0123456789abcdef");
+        assert_eq!(
+            seeds,
+            vec![
+                b"pool".to_vec(),
+                b"x_0123456789abcdef".to_vec(),
+                vec![3u8],
+            ]
+        );
     }
 
     #[test]
